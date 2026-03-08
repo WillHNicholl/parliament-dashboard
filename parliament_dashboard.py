@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from wordcloud import WordCloud
 
-API_KEY = "BqRJoXFidAbGDih2fzFsnFJ6"
+API_KEY = st.secrets["API_KEY"]
 BASE_URL = "https://www.theyworkforyou.com/api/"
 
 st.set_page_config(
