@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Mar  8 13:58:17 2026
-
-@author: adelegarrick
-"""
-
-#!/usr/bin/env python3
 """
 Parliamentary Debate Analyser — Streamlit Dashboard
 Run with: streamlit run parliament_dashboard.py
@@ -23,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from wordcloud import WordCloud
 
-TWFY_API_KEY = "BqRJoXFidAbGDih2fzFsnFJ6"
+TWFY_API_KEY = st.secrets["TWFY_API_KEY"]
 BASE_URL = "https://www.theyworkforyou.com/api/"
 
 st.set_page_config(
