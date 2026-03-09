@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Mar  8 13:58:17 2026
+
+@author: adelegarrick
+"""
+
+#!/usr/bin/env python3
 """
 Parliamentary Debate Analyser — Streamlit Dashboard
 Run with: streamlit run parliament_dashboard.py
