@@ -3,3 +3,4 @@ requests
 matplotlib
 python-dateutil
 wordcloud
+plotly
