@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Mar  8 13:58:17 2026
-
-@author: adelegarrick
-"""
-
-#!/usr/bin/env python3
 """
 Parliamentary Debate Analyser — Streamlit Dashboard
 Run with: streamlit run parliament_dashboard.py
@@ -24,6 +16,7 @@ import matplotlib.ticker as ticker
 from wordcloud import WordCloud
 
 TWFY_API_KEY = st.secrets["TWFY_API_KEY"]
+ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
 BASE_URL = "https://www.theyworkforyou.com/api/"
 
 st.set_page_config(
@@ -80,7 +73,9 @@ def extract_excerpt(body, base_word, context_chars=300):
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
 
-def fetch_debates_for_term(search_term, debate_type, progress_cb):
+def fetch_debates_for_term(search_term, debate_type, progress_cb,
+                           cutoff_start=None, max_results=500):
+    """Fetch debates for a term, stopping early at the date cutoff or result cap."""
     all_results, page = [], 1
     while True:
         params = {"key": TWFY_API_KEY, "search": search_term, "type": debate_type,
@@ -93,17 +88,50 @@ def fetch_debates_for_term(search_term, debate_type, progress_cb):
         rows = data.get("rows", [])
         if not rows:
             break
-        all_results.extend(rows)
         total = int(data.get("info", {}).get("total_results", 0))
-        progress_cb(len(all_results), total, search_term)
-        page += 1
-        if len(all_results) >= total:
+        # Early exit once results go past start date
+        if cutoff_start:
+            in_range, past_range = [], False
+            for row in rows:
+                try:
+                    row_date = datetime.strptime(row.get("hdate", ""), "%Y-%m-%d").date()
+                    if row_date >= cutoff_start:
+                        in_range.append(row)
+                    else:
+                        past_range = True
+                except ValueError:
+                    in_range.append(row)
+            all_results.extend(in_range)
+            progress_cb(len(all_results), total, search_term)
+            if past_range:
+                break
+        else:
+            all_results.extend(rows)
+            progress_cb(len(all_results), total, search_term)
+        # Hard cap to avoid runaway fetching
+        if len(all_results) >= max_results or len(all_results) >= total:
             break
+        page += 1
     return all_results
+
 
 
 def run_term_search(term, debate_type, start_date, end_date):
     base_word = term.strip().lower().rstrip("s")
+    plural = base_word + "s"
+    # Only search both forms if the plural differs meaningfully from the original term
+    original = term.strip().lower()
+    search_terms = [original]
+    if original == base_word and plural != original:
+        # Term was already a base form — also search plural
+        search_terms = [base_word, plural]
+    elif original == plural:
+        # Term was entered as plural — also search singular
+        search_terms = [base_word, plural]
+    # Deduplicate (e.g. "data" base and plural are identical)
+    search_terms = list(dict.fromkeys(search_terms))
+
+    cutoff_start = date(start_date.year, start_date.month, 1)
     progress_bar = st.progress(0, text="Starting search...")
     status_text = st.empty()
 
@@ -112,9 +140,10 @@ def run_term_search(term, debate_type, start_date, end_date):
                                text=f'Fetching "{current_term}": {fetched} / {total} speeches')
 
     seen_gids, all_rows = set(), []
-    for t in [base_word, base_word + "s"]:
+    for t in search_terms:
         status_text.text(f'Searching for "{t}"...')
-        for row in fetch_debates_for_term(t, debate_type, update_progress):
+        for row in fetch_debates_for_term(t, debate_type, update_progress,
+                                          cutoff_start=cutoff_start):
             gid = row.get("gid")
             if gid and gid not in seen_gids:
                 seen_gids.add(gid)
@@ -260,7 +289,8 @@ def fetch_all_members():
     return sorted(members, key=lambda x: x["name"])
 
 
-def fetch_speeches_for_person(person_id, debate_type, progress_cb):
+def fetch_speeches_for_person(person_id, debate_type, progress_cb, cutoff_start=None):
+    """Fetch speeches, stopping early once results go past cutoff_start date."""
     all_results, page = [], 1
     while True:
         params = {"key": TWFY_API_KEY, "person": person_id, "type": debate_type,
@@ -273,9 +303,28 @@ def fetch_speeches_for_person(person_id, debate_type, progress_cb):
         rows = data.get("rows", [])
         if not rows:
             break
-        all_results.extend(rows)
+        # Early exit — API returns newest first, so once we see dates before
+        # our start date we can stop fetching further pages
+        if cutoff_start:
+            in_range = []
+            past_range = False
+            for row in rows:
+                try:
+                    row_date = datetime.strptime(row.get("hdate", ""), "%Y-%m-%d").date()
+                    if row_date >= cutoff_start:
+                        in_range.append(row)
+                    else:
+                        past_range = True
+                except ValueError:
+                    in_range.append(row)
+            all_results.extend(in_range)
+            progress_cb(len(all_results), int(data.get("info", {}).get("total_results", 0)))
+            if past_range:
+                break
+        else:
+            all_results.extend(rows)
+            progress_cb(len(all_results), int(data.get("info", {}).get("total_results", 0)))
         total = int(data.get("info", {}).get("total_results", 0))
-        progress_cb(len(all_results), total)
         page += 1
         if len(all_results) >= total:
             break
@@ -289,6 +338,23 @@ def filter_speeches_by_date(rows, start_date, end_date):
     return [r for r in rows
             if cutoff_start <= datetime.strptime(r.get("hdate", "1900-01-01"), "%Y-%m-%d").date() <= cutoff_end
             if r.get("hdate")]
+
+
+@st.cache_data(show_spinner=False)
+def fetch_person_profile(person_id):
+    """Fetch profile details for an MP/Lord via TWFY getPerson."""
+    try:
+        resp = requests.get(BASE_URL + "getPerson",
+                            params={"key": TWFY_API_KEY, "id": person_id, "output": "json"},
+                            timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0]
+    except Exception:
+        pass
+    return {}
+
 
 
 def get_top_words(rows, top_n=60):
@@ -338,6 +404,83 @@ def make_topic_bar(word_freq, mp_name):
 
 
 
+
+
+@st.cache_data(show_spinner=False)
+def analyse_term_landscape(term, debate_type, start_str, end_str, speaker_summary):
+    """Ask Claude for a thematic landscape summary of who's talking about a term and why."""
+    import json
+
+    prompt = f"""You are a political analyst reviewing UK parliamentary debate data.
+
+The term "{term}" was mentioned in {debate_type} debates between {start_str} and {end_str}.
+
+Below is a summary of the key speakers and how many times they mentioned the term, along with excerpts from their speeches.
+
+Write a single concise paragraph (4-6 sentences) summarising the overall landscape: who is driving discussion of this topic, what angles or contexts they are raising it in, and whether there appear to be any notable dividing lines (e.g. party, government vs opposition, scrutiny vs advocacy).
+
+Do not use bullet points. Write in plain prose suitable for a policy professional.
+
+Speaker data:
+{speaker_summary}"""
+
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+    }
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 500,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    resp = requests.post("https://api.anthropic.com/v1/messages",
+                         headers=headers, json=body, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"].strip()
+
+
+
+# ── Claude AI analysis ───────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def analyse_with_claude(person_id, mp_name, start_str, end_str, speech_text):
+    """Call Claude to identify top policy themes. Cached by person + date range."""
+    import json
+
+    prompt = f"""You are a political analyst. Below are parliamentary speeches by {mp_name}
+between {start_str} and {end_str}.
+
+Identify the top 8 policy themes or topics this person focuses on most.
+Rank them from most to least prominent.
+
+Return ONLY a JSON array with no preamble or markdown, in this exact format:
+[
+  {{"rank": 1, "theme": "Theme name", "explanation": "One sentence explanation of their position or focus."}},
+  ...
+]
+
+Speeches:
+{speech_text}"""
+
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+    }
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1000,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    resp = requests.post("https://api.anthropic.com/v1/messages",
+                         headers=headers, json=body, timeout=30)
+    resp.raise_for_status()
+    result = resp.json()
+    raw = result["content"][0]["text"].strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+    return json.loads(raw)
 
 
 # ── Speakers panel (shared between peak auto-highlight and click) ──────────────
@@ -400,8 +543,9 @@ def render_speakers_for_month(month_label, monthly_speakers, buckets, term):
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-st.title("🏛️ Parliamentary Debate Analyser")
+st.title("🏛️ Parliamentary Policy Engagement Dashboard")
 st.caption("Track mentions of topics and explore what individual MPs speak about")
+st.info("⚠️ Results may not include debates from the last few days.")
 st.divider()
 
 tab1, tab2 = st.tabs(["Term Search", "MP / Member Profile"])
@@ -492,6 +636,34 @@ with tab1:
                 "**Click any bar** to explore who was speaking that month. "
                 "**Amber bar** = currently selected."
             )
+
+            st.divider()
+
+            # ── Claude thematic landscape ─────────────────────────────────────
+            st.markdown("#### 🤖 Thematic Landscape")
+            with st.spinner("Analysing who's talking and why..."):
+                try:
+                    # Build a compact speaker summary to send to Claude
+                    top_speakers = sorted(mp_data.items(),
+                                          key=lambda x: x[1]["mentions"], reverse=True)[:15]
+                    lines = []
+                    for name, info in top_speakers:
+                        excerpts = " | ".join(
+                            s["excerpt"][:200] for s in info["speeches"][:2]
+                        )
+                        lines.append(
+                            f"{name} ({info['party']}): {info['mentions']} mention(s). {excerpts}"
+                        )
+                    speaker_summary = "\n".join(lines)[:6000]
+                    landscape = analyse_term_landscape(
+                        term, dtype,
+                        list(buckets.keys())[0],
+                        list(buckets.keys())[-1],
+                        speaker_summary
+                    )
+                    st.markdown(landscape)
+                except Exception as ai_err:
+                    st.warning(f"AI analysis unavailable: {ai_err}")
 
             st.divider()
 
@@ -591,8 +763,10 @@ with tab2:
                     progress_bar.progress(min(fetched / max(total, 1), 1.0),
                                           text=f"Fetched {fetched} / {total} speeches")
 
+                cutoff_start = date(mp_start.year, mp_start.month, 1)
                 rows = fetch_speeches_for_person(selected["person_id"],
-                                                 mp_debate_type, mp_progress)
+                                                 mp_debate_type, mp_progress,
+                                                 cutoff_start=cutoff_start)
                 progress_bar.empty()
                 filtered = filter_speeches_by_date(rows, mp_start, mp_end)
                 word_freq = get_top_words(filtered)
@@ -612,9 +786,62 @@ with tab2:
                     + f" · {mp_start.strftime('%b %Y')} to {mp_end.strftime('%b %Y')}"
                 )
 
+                # ── MP profile details ────────────────────────────────────────
+                profile = fetch_person_profile(selected["person_id"])
+                if profile:
+                    with st.expander("📋 Profile details", expanded=True):
+                        pcol1, pcol2 = st.columns(2)
+                        with pcol1:
+                            if profile.get("email"):
+                                st.markdown(f"**Email:** {profile['email']}")
+                            if profile.get("constituency"):
+                                st.markdown(f"**Constituency:** {profile['constituency']}")
+                            if profile.get("party"):
+                                st.markdown(f"**Party:** {profile['party']}")
+                            if profile.get("office"):
+                                for office in profile["office"]:
+                                    st.markdown(f"**Role:** {office.get('position','')}"
+                                                + (f" · {office.get('dept','')}" if office.get('dept') else ""))
+                        with pcol2:
+                            committees = [o for o in profile.get("office", [])
+                                          if "committee" in o.get("dept", "").lower()
+                                          or "committee" in o.get("position", "").lower()]
+                            if committees:
+                                st.markdown("**Committees:**")
+                                for c in committees:
+                                    st.markdown(f"- {c.get('position','')} · {c.get('dept','')}")
+                            if profile.get("url"):
+                                st.markdown(f"[TheyWorkForYou profile]({profile['url']})")
+                            if profile.get("twitter_username"):
+                                st.markdown(f"**Twitter:** @{profile['twitter_username']}")
+
                 if not word_freq:
                     st.info("No speeches found for this member in the selected date range.")
                 else:
+                    # ── Claude AI theme analysis ─────────────────────────────
+                    st.markdown("#### 🤖 AI Policy Theme Analysis")
+                    with st.spinner("Analysing speeches with Claude..."):
+                        try:
+                            # Trim to 8,000 chars — enough context, much faster
+                            speech_text = " ".join(
+                                clean_html(s.get("body", "")) for s in filtered
+                            )[:8000]
+                            themes = analyse_with_claude(
+                                selected["person_id"],
+                                selected["name"],
+                                mp_start.strftime("%b %Y"),
+                                mp_end.strftime("%b %Y"),
+                                speech_text
+                            )
+                            for t in themes:
+                                st.markdown(f"**{t['rank']}. {t['theme']}**  \n{t['explanation']}")
+                        except Exception as ai_err:
+                            st.warning(f"AI analysis unavailable: {ai_err}")
+
+                    st.divider()
+
+                    # ── Word cloud + frequency bar ────────────────────────────
+                    st.markdown("#### 📊 Word Frequency")
                     col_wc, col_bar = st.columns(2)
                     with col_wc:
                         st.markdown("**Word Cloud**")
