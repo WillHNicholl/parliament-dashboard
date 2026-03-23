@@ -987,7 +987,7 @@ with tab3:
     st.markdown("### 💬 Ask a Question")
     st.caption(
         "Ask a general question about what MPs have been discussing. "
-        "Claude will search parliamentary debates and summarise the findings."
+        "The dashboard will use AI search parliamentary debates and summarise the findings."
     )
 
     with st.form("question_form"):
