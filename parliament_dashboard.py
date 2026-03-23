@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Mar 13 07:57:48 2026
+
+@author: adelegarrick
+"""
+
+#!/usr/bin/env python3
 """
 Parliamentary Debate Analyser — Streamlit Dashboard
 Run with: streamlit run parliament_dashboard.py
@@ -340,6 +348,42 @@ def filter_speeches_by_date(rows, start_date, end_date):
             if r.get("hdate")]
 
 
+DEBATE_TYPE_LABELS = {
+    "debates": "Commons Chamber",
+    "westminsterhall": "Westminster Hall",
+    "lords": "House of Lords",
+    "lordswrans": "Lords Written Answers",
+    "wrans": "Written Answers",
+    "wms": "Written Ministerial Statements",
+    "questions": "Oral Questions",
+}
+
+def get_debate_type_label(htype):
+    return DEBATE_TYPE_LABELS.get(htype, htype or "Parliament")
+
+def identify_led_debates(rows):
+    """
+    Return a set of parent debate titles where this MP was the lead/opening speaker.
+    Lead speaker = first speech in that debate section (lowest subsection_id or first encountered).
+    """
+    debate_first_seen = {}  # parent_title -> first subsection_id seen
+    for row in sorted(rows, key=lambda x: (x.get("hdate",""), x.get("subsection_id", 999))):
+        parent = row.get("parent", {}).get("body", "")
+        if not parent:
+            continue
+        sub_id = row.get("subsection_id", 999)
+        if parent not in debate_first_seen:
+            debate_first_seen[parent] = sub_id
+    # A debate is "led" by this MP if their first sub_id matches the lowest seen
+    led = set()
+    for row in rows:
+        parent = row.get("parent", {}).get("body", "")
+        sub_id = row.get("subsection_id", 999)
+        if parent and debate_first_seen.get(parent) == sub_id:
+            led.add(parent)
+    return led
+
+
 @st.cache_data(show_spinner=False)
 def fetch_person_profile(person_id):
     """Fetch profile details for an MP/Lord via TWFY getPerson."""
@@ -483,6 +527,68 @@ Speeches:
     return json.loads(raw)
 
 
+@st.cache_data(show_spinner=False)
+def extract_search_terms(question):
+    """Ask Claude to extract the best search terms from a natural language question."""
+    import json
+    prompt = f"""You are a parliamentary research assistant. A user has asked the following question about UK parliamentary debates:
+
+"{question}"
+
+Identify 1-3 short search terms (single words or short phrases) that would best retrieve relevant debates from a parliamentary search engine. Focus on the most specific and distinctive terms.
+
+Return ONLY a JSON array of strings, e.g. ["sustainability", "net zero"] with no preamble."""
+
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+    }
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    resp = requests.post("https://api.anthropic.com/v1/messages",
+                         headers=headers, json=body, timeout=30)
+    resp.raise_for_status()
+    raw = resp.json()["content"][0]["text"].strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+    return json.loads(raw)
+
+
+@st.cache_data(show_spinner=False)
+def answer_question(question, debates_summary):
+    """Ask Claude to answer the question based on debate evidence."""
+    prompt = f"""You are a parliamentary research assistant. A user has asked:
+
+"{question}"
+
+Below is a summary of relevant UK parliamentary debates retrieved for this question. 
+Write a response of 4-6 sentences directly answering the question based on this evidence. 
+Then list the most relevant specific debates. Write in plain prose suitable for a policy professional.
+Do not make up or infer anything not present in the debate data.
+
+Debate data:
+{debates_summary}"""
+
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+    }
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 800,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    resp = requests.post("https://api.anthropic.com/v1/messages",
+                         headers=headers, json=body, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"].strip()
+
+
+
 # ── Speakers panel (shared between peak auto-highlight and click) ──────────────
 
 def render_speakers_for_month(month_label, monthly_speakers, buckets, term):
@@ -545,10 +651,9 @@ def render_speakers_for_month(month_label, monthly_speakers, buckets, term):
 
 st.title("🏛️ Parliamentary Policy Engagement Dashboard")
 st.caption("Track mentions of topics and explore what individual MPs speak about")
-st.info("⚠️ Results may not include debates from the last few days.")
 st.divider()
 
-tab1, tab2 = st.tabs(["Term Search", "MP / Member Profile"])
+tab1, tab2, tab3 = st.tabs(["Term Search", "MP / Member Profile", "Ask a Question"])
 
 # ════ TAB 1 ══════════════════════════════════════════════════════════════════
 with tab1:
@@ -771,12 +876,14 @@ with tab2:
                 filtered = filter_speeches_by_date(rows, mp_start, mp_end)
                 word_freq = get_top_words(filtered)
                 total_words = sum(c for _, c in word_freq)
+                led_debates = identify_led_debates(filtered)
 
                 st.divider()
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Speeches in range", len(filtered))
                 c2.metric("Unique topics (words)", len(word_freq))
                 c3.metric("Total word count", total_words)
+                c4.metric("Debates led", len(led_debates))
                 st.divider()
 
                 st.subheader(f"Key topics — {selected['name']}")
@@ -814,6 +921,24 @@ with tab2:
                                 st.markdown(f"[TheyWorkForYou profile]({profile['url']})")
                             if profile.get("twitter_username"):
                                 st.markdown(f"**Twitter:** @{profile['twitter_username']}")
+
+                # ── Debates led ──────────────────────────────────────────
+                if led_debates:
+                    with st.expander(f"🎙️ Debates led ({len(led_debates)})", expanded=False):
+                        st.caption("Debates where this member was the opening speaker.")
+                        for row in sorted(filtered,
+                                          key=lambda x: x.get("hdate", ""), reverse=True):
+                            parent = row.get("parent", {}).get("body", "")
+                            if parent not in led_debates:
+                                continue
+                            htype = row.get("htype", "")
+                            label = get_debate_type_label(htype)
+                            url = "https://www.theyworkforyou.com" + row.get("listurl", "")
+                            st.markdown(
+                                f"**{row.get('hdate','')}** · {label} · "
+                                f"[{parent}]({url})"
+                            )
+                            led_debates.discard(parent)  # show each once
 
                 if not word_freq:
                     st.info("No speeches found for this member in the selected date range.")
@@ -853,6 +978,142 @@ with tab2:
                         fig_bar = make_topic_bar(word_freq, selected["name"])
                         st.pyplot(fig_bar)
                         plt.close(fig_bar)
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+# ════ TAB 3 ══════════════════════════════════════════════════════════════════
+with tab3:
+    st.markdown("### 💬 Ask a Question")
+    st.caption(
+        "Ask a general question about what MPs have been discussing. "
+        "Claude will search parliamentary debates and summarise the findings."
+    )
+
+    with st.form("question_form"):
+        col1, col2, col3 = st.columns([4, 1.5, 1.5])
+        with col1:
+            user_question = st.text_input(
+                "Your question",
+                placeholder="e.g. What are the main issues on sustainability MPs have been discussing?"
+            )
+        with col2:
+            q_debate_type = st.selectbox("Chamber",
+                options=["commons", "lords", "westminsterhall"],
+                format_func=lambda x: {"commons": "Commons", "lords": "Lords",
+                                        "westminsterhall": "Westminster Hall"}[x],
+                key="q_chamber")
+        with col3:
+            q_months = st.selectbox("Time period",
+                options=[3, 6, 12, 24],
+                format_func=lambda x: f"Last {x} months",
+                index=1,
+                key="q_months")
+        q_submitted = st.form_submit_button("Ask", use_container_width=True)
+
+    if q_submitted:
+        if not user_question.strip():
+            st.warning("Please enter a question.")
+        else:
+            try:
+                q_end = date.today()
+                q_start = q_end - relativedelta(months=q_months)
+
+                # Step 1 — extract search terms
+                with st.spinner("Identifying search terms..."):
+                    search_terms = extract_search_terms(user_question.strip())
+                    st.caption(f"🔍 Searching for: {', '.join(search_terms)}")
+
+                # Step 2 — fetch debates for each term
+                all_debates = {}  # debate_title -> {url, date, speakers, excerpts}
+                cutoff_start = date(q_start.year, q_start.month, 1)
+
+                progress_bar = st.progress(0, text="Fetching debates...")
+
+                def q_progress(fetched, total, term):
+                    progress_bar.progress(
+                        min(fetched / max(total, 1), 1.0),
+                        text=f'Fetching "{term}": {fetched} / {total}'
+                    )
+
+                seen_gids = set()
+                for term in search_terms:
+                    base = term.strip().lower().rstrip("s")
+                    for t in list(dict.fromkeys([base, base + "s"])):
+                        rows = fetch_debates_for_term(
+                            t, q_debate_type, q_progress,
+                            cutoff_start=cutoff_start, max_results=200
+                        )
+                        for row in rows:
+                            gid = row.get("gid", "")
+                            if not gid or gid in seen_gids:
+                                continue
+                            try:
+                                row_date = datetime.strptime(
+                                    row.get("hdate", ""), "%Y-%m-%d").date()
+                            except ValueError:
+                                continue
+                            if not (cutoff_start <= row_date <= q_end):
+                                continue
+                            seen_gids.add(gid)
+                            debate_title = row.get("parent", {}).get("body", "Unknown debate")
+                            url = "https://www.theyworkforyou.com" + row.get("listurl", "")
+                            speaker = row.get("speaker", {})
+                            key = debate_title
+                            if key not in all_debates:
+                                all_debates[key] = {
+                                    "url": url,
+                                    "date": row.get("hdate", ""),
+                                    "speakers": set(),
+                                    "excerpts": []
+                                }
+                            name = speaker.get("name", "")
+                            if name:
+                                all_debates[key]["speakers"].add(name)
+                            body = clean_html(row.get("body", ""))
+                            if body:
+                                all_debates[key]["excerpts"].append(body[:300])
+
+                progress_bar.empty()
+
+                if not all_debates:
+                    st.info("No relevant debates found. Try rephrasing your question.")
+                else:
+                    # Step 3 — build summary for Claude
+                    lines = []
+                    for title, info in sorted(
+                        all_debates.items(),
+                        key=lambda x: x[1]["date"], reverse=True
+                    )[:30]:
+                        speakers_str = ", ".join(list(info["speakers"])[:5])
+                        excerpt = info["excerpts"][0] if info["excerpts"] else ""
+                        lines.append(
+                            f"Debate: {title} ({info['date']})\n"
+                            f"Speakers: {speakers_str}\n"
+                            f"Extract: {excerpt}\n"
+                            f"URL: {info['url']}"
+                        )
+                    debates_summary = "\n\n".join(lines)[:8000]
+
+                    # Step 4 — get Claude's answer
+                    with st.spinner("Analysing findings..."):
+                        answer = answer_question(user_question.strip(), debates_summary)
+
+                    st.divider()
+                    st.markdown("#### 📋 Summary")
+                    st.markdown(answer)
+
+                    st.divider()
+                    st.markdown("#### 📄 Most relevant debates")
+                    for title, info in sorted(
+                        all_debates.items(),
+                        key=lambda x: x[1]["date"], reverse=True
+                    )[:15]:
+                        speakers_str = ", ".join(list(info["speakers"])[:4])
+                        st.markdown(
+                            f"**{info['date']}** — [{title}]({info['url']})"
+                            + (f"  \n_{speakers_str}_" if speakers_str else "")
+                        )
 
             except Exception as e:
                 st.error(f"Error: {e}")
